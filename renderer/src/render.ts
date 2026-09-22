@@ -12,12 +12,14 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { get } from 'node:https';
 import { bundle } from '@remotion/bundler';
 import { ensureBrowser, renderMedia, renderStill, selectComposition } from '@remotion/renderer';
 import { semanticVideoSpecProblems, validateVideoSpec } from '@avm/shared';
-import type { Dataset, ThumbnailSpec, VideoSpec } from '@avm/shared';
+import type { Dataset, Story, ThumbnailSpec, VideoSpec } from '@avm/shared';
 import type { FrameTape } from './frameTape';
 import type { RenderInput } from './types';
+import { DEFAULT_FLAG_BASE } from './types';
 
 interface Args {
   project?: string;
@@ -45,14 +47,74 @@ function readJson<T>(path: string): T {
   return JSON.parse(readFileSync(path, 'utf8')) as T;
 }
 
-function loadInput(projectDir: string): { input: RenderInput; spec: VideoSpec; quality: unknown } {
+/**
+ * Fetch a flag PNG and return it as a data URI. Flags are embedded at render
+ * time so frames never depend on flag CDNs being reachable from the browser
+ * (sandboxed CI runners in particular often can't load them due to TLS
+ * interception). Failures resolve to undefined and components fall back to
+ * the remote URL.
+ */
+function fetchFlagDataUri(flagBaseUrl: string, code: string): Promise<string | undefined> {
+  const url = `${flagBaseUrl}/w160/${code.toLowerCase()}.png`;
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(() => resolvePromise(undefined), 15000);
+    get(url, { headers: { 'User-Agent': 'analysis-video-maker/1.0' } }, (res) => {
+      if (res.statusCode !== 200) {
+        clearTimeout(timer);
+        res.resume();
+        resolvePromise(undefined);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        clearTimeout(timer);
+        const buf = Buffer.concat(chunks);
+        if (buf.length === 0) resolvePromise(undefined);
+        else resolvePromise(`data:image/png;base64,${buf.toString('base64')}`);
+      });
+      res.on('error', () => {
+        clearTimeout(timer);
+        resolvePromise(undefined);
+      });
+    }).on('error', () => {
+      clearTimeout(timer);
+      resolvePromise(undefined);
+    });
+  });
+}
+
+/** Populate `flagDataUri` on every entity that has a flagCode. */
+async function embedFlags(input: RenderInput): Promise<void> {
+  const base = input.flagBaseUrl ?? DEFAULT_FLAG_BASE;
+  const codes = [...new Set(input.frameTape.entities.map((e) => e.flagCode?.toLowerCase()).filter((c): c is string => !!c))];
+  if (codes.length === 0) return;
+  process.stdout.write(`embedding ${codes.length} flags from ${base}\n`);
+  const results = await Promise.all(codes.map((code) => fetchFlagDataUri(base, code)));
+  const byCode = new Map(codes.map((code, i) => [code, results[i]]));
+  let embedded = 0;
+  for (const entity of input.frameTape.entities) {
+    const uri = entity.flagCode ? byCode.get(entity.flagCode.toLowerCase()) : undefined;
+    if (uri) {
+      entity.flagDataUri = uri;
+      embedded += 1;
+    }
+  }
+  process.stdout.write(`embedded ${embedded}/${codes.length} flags\n`);
+}
+
+async function loadInput(projectDir: string): Promise<{ input: RenderInput; spec: VideoSpec; quality: unknown }> {
   const spec = readJson<VideoSpec>(join(projectDir, 'video-spec.json'));
   const dataset = readJson<Dataset>(join(projectDir, 'dataset.json'));
   const frameTape = readJson<FrameTape>(join(projectDir, 'frames.json'));
   const thumbnailPath = join(projectDir, 'thumbnail.json');
   const thumbnail = existsSync(thumbnailPath) ? readJson<ThumbnailSpec>(thumbnailPath) : undefined;
+  const storyPath = join(projectDir, 'story.json');
+  const story = existsSync(storyPath) ? readJson<Story>(storyPath) : undefined;
   const quality = existsSync(join(projectDir, 'quality.json')) ? readJson<unknown>(join(projectDir, 'quality.json')) : undefined;
-  return { input: { videoSpec: spec, dataset, frameTape, thumbnail }, spec, quality };
+  const input: RenderInput = { videoSpec: spec, dataset, frameTape, thumbnail, story };
+  await embedFlags(input);
+  return { input, spec, quality };
 }
 
 /**
@@ -71,7 +133,7 @@ async function main(): Promise<void> {
   const projectDir = resolve(args.project);
   if (!existsSync(projectDir)) throw new Error(`project directory not found: ${projectDir}`);
 
-  const { input, spec, quality } = loadInput(projectDir);
+  const { input, spec, quality } = await loadInput(projectDir);
 
   // --- gates --------------------------------------------------------------
   const schema = validateVideoSpec(spec);
@@ -133,6 +195,7 @@ async function main(): Promise<void> {
     outputLocation: out,
     inputProps: props,
     concurrency: CONCURRENCY,
+    videoBitrate: '8M',
     onProgress: ({ renderedFrames, encodedFrames }) => {
       if (renderedFrames % 150 === 0) process.stdout.write(`  ${renderedFrames}/${composition.durationInFrames} frames (${encodedFrames} encoded)\n`);
     },

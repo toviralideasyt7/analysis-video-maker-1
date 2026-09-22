@@ -171,25 +171,34 @@ export async function worldBankFetch(
   const start = options.start ?? 1960;
   const end = options.end ?? new Date().getFullYear();
   const url = `${base}/country/${codes}/indicator/${indicator}?format=json&per_page=20000&date=${start}:${end}`;
-  const payload = await getJson<unknown[]>(url, { timeoutMs: 90_000 });
-  if (!Array.isArray(payload) || payload.length < 2) {
-    throw new Error(`World Bank returned an unexpected payload for ${indicator}`);
-  }
-  const meta = payload[0] as { total?: number; page?: number; pages?: number };
+  // World Bank caps a page well below 20000 for wide queries, so every page
+  // is followed. Reading only page 1 silently dropped most countries.
   const rows: WorldBankRow[] = [];
-  for (const item of (payload[1] as Array<Record<string, unknown>>) ?? []) {
-    const country = (item.country ?? {}) as { id?: string; value?: string };
-    const indicatorNode = (item.indicator ?? {}) as { id?: string; value?: string };
-    rows.push({
-      countryIso3: String(country.id ?? ''),
-      countryName: String(country.value ?? ''),
-      indicatorId: String(indicatorNode.id ?? indicator),
-      date: String(item.date ?? ''),
-      value: typeof item.value === 'number' ? item.value : null,
-    });
-  }
-  if ((meta.pages ?? 1) > 1) {
-    logger.warn('World Bank response is paged; only the first page was read', { indicator, pages: meta.pages, total: meta.total });
+  let page = 1;
+  let pages = 1;
+  do {
+    const pageUrl = `${url}&page=${page}`;
+    const payload = await getJson<unknown[]>(pageUrl, { timeoutMs: 90_000 });
+    if (!Array.isArray(payload) || payload.length < 2) {
+      throw new Error(`World Bank returned an unexpected payload for ${indicator} (page ${page})`);
+    }
+    const meta = payload[0] as { total?: number; page?: number; pages?: number };
+    pages = meta.pages ?? 1;
+    for (const item of (payload[1] as Array<Record<string, unknown>>) ?? []) {
+      const country = (item.country ?? {}) as { id?: string; value?: string };
+      const indicatorNode = (item.indicator ?? {}) as { id?: string; value?: string };
+      rows.push({
+        countryIso3: String(country.id ?? ''),
+        countryName: String(country.value ?? ''),
+        indicatorId: String(indicatorNode.id ?? indicator),
+        date: String(item.date ?? ''),
+        value: typeof item.value === 'number' ? item.value : null,
+      });
+    }
+    page += 1;
+  } while (page <= pages);
+  if (pages > 1) {
+    logger.info('World Bank pagination followed', { indicator, pages, rows: rows.length });
   }
   const definition = definitionFor('World Bank Open Data');
   return {

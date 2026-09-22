@@ -116,9 +116,73 @@ Reply with JSON only, shaped exactly like:
 // 2. Source Hunter - DataPlan -> SourceCandidate[]
 // ---------------------------------------------------------------------------
 
+/** Normalise a URL for dedupe: same page reached twice counts once. */
+function normaliseUrlForDedupe(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    const keep = new URLSearchParams();
+    for (const [k, v] of u.searchParams) {
+      if (!/^(utm_|fbclid$|gclid$|mc_|ref$)/i.test(k)) keep.append(k, v);
+    }
+    u.search = keep.toString();
+    return u.toString().replace(/\/$/, '').toLowerCase();
+  } catch {
+    return url.trim().toLowerCase();
+  }
+}
+
+/**
+ * Hosts whose data is worth trusting more than a random web hit. Anything not
+ * listed (or not under a .gov/.edu domain) keeps the base web-hit authority.
+ */
+const AUTHORITATIVE_HOSTS = new Set([
+  'worldbank.org',
+  'data.worldbank.org',
+  'api.worldbank.org',
+  'databank.worldbank.org',
+  'data.un.org',
+  'unstats.un.org',
+  'population.un.org',
+  'oecd.org',
+  'stats.oecd.org',
+  'data.oecd.org',
+  'ourworldindata.org',
+  'data.europa.eu',
+  'ec.europa.eu',
+  'eurostat.ec.europa.eu',
+  'fred.stlouisfed.org',
+  'data.gov',
+  'census.gov',
+  'api.census.gov',
+  'bls.gov',
+  'bea.gov',
+  'who.int',
+  'data.who.int',
+  'imf.org',
+  'data.imf.org',
+  'fao.org',
+  'fenixservices.fao.org',
+]);
+
+function authorityForHost(host: string): number {
+  if (!host) return 0.3;
+  if (AUTHORITATIVE_HOSTS.has(host)) return 0.8;
+  if (/(^|\.)gov(\.|$)/.test(host) || host.endsWith('.edu')) return 0.7;
+  if (/(^|\.)(wikipedia|wikidata)\.org$/.test(host)) return 0.55;
+  return 0.3;
+}
+
 export async function huntSources(plan: DataPlan, ctx: AgentContext): Promise<SourceCandidate[]> {
   const scouted = await scoutQueries(plan, ctx);
   const found: SourceCandidate[] = candidatesFromScout(scouted);
+
+  const seenUrls = new Set<string>();
+  for (const c of found) seenUrls.add(normaliseUrlForDedupe(c.url));
+  const perHost = new Map<string, number>();
+  const perQueryHits: Array<{ query: string; hits: number }> = [];
+  let duplicatesDropped = 0;
+  const MAX_PER_HOST = 3;
 
   for (const query of scouted.queries) {
     if (ctx.budget.exhausted()) {
@@ -126,11 +190,27 @@ export async function huntSources(plan: DataPlan, ctx: AgentContext): Promise<So
       break;
     }
     const results = await ctx.search.search(query, { limit: 8 });
+    let hits = 0;
     for (const r of results) {
+      const dedupeKey = normaliseUrlForDedupe(r.url);
+      if (seenUrls.has(dedupeKey)) {
+        duplicatesDropped += 1;
+        continue;
+      }
+      const host = hostOf(r.url) || 'web';
+      const hostCount = perHost.get(host) ?? 0;
+      if (hostCount >= MAX_PER_HOST) {
+        duplicatesDropped += 1;
+        continue;
+      }
+      seenUrls.add(dedupeKey);
+      perHost.set(host, hostCount + 1);
+      hits += 1;
+      const machineReadable = /\.(csv|json|xlsx?|tsv)(\?|$)/i.test(r.url) || /\/api\//i.test(r.url);
       found.push({
-        candidateId: `web_${hostOf(r.url)}_${found.length}`,
-        sourceName: hostOf(r.url) || 'web',
-        publisher: hostOf(r.url) || 'web',
+        candidateId: `web_${host.replace(/[^a-z0-9]+/g, '-')}_${found.length}`,
+        sourceName: host,
+        publisher: host,
         url: r.url,
         kind: 'web',
         accessMethod: 'web',
@@ -138,9 +218,9 @@ export async function huntSources(plan: DataPlan, ctx: AgentContext): Promise<So
         description: r.snippet,
         retrievedAt: new Date().toISOString(),
         license: 'UNKNOWN',
-        machineReadable: /\.(csv|json|xlsx?|tsv)(\?|$)/i.test(r.url) || /\/api\//i.test(r.url),
-        authority: 0.3,
-        directness: 0.25,
+        machineReadable,
+        authority: authorityForHost(host),
+        directness: machineReadable ? 0.6 : 0.25,
         coverage: 0.3,
         methodologyTransparency: 0.2,
         recency: 0.4,
@@ -152,8 +232,14 @@ export async function huntSources(plan: DataPlan, ctx: AgentContext): Promise<So
         notes: [`query: ${query}`, 'web hit: must be followed through to actual data before use'],
       });
     }
+    perQueryHits.push({ query, hits });
   }
-  logRun(ctx, 'source-hunter', plan.topic, { count: found.length, queries: scouted.queries.length });
+  logRun(ctx, 'source-hunter', plan.topic, {
+    candidates: found.length,
+    queries: perQueryHits,
+    duplicatesDropped,
+    hosts: [...perHost.entries()].map(([host, count]) => `${host}:${count}`),
+  });
   return found;
 }
 // ---------------------------------------------------------------------------
@@ -175,6 +261,11 @@ export async function judgeSources(candidates: SourceCandidate[], ctx: AgentCont
 Decide which of these candidates can actually supply machine-readable data for the
 stated metric. Reject pages that merely mention numbers, are paywalled, are
 secondary reporting without data, or have an unknown licence for redistribution.
+
+Prefer candidates whose publisher is INDEPENDENT of the other accepted
+candidates: the verification stage needs two different publishers agreeing
+before it marks anything verified, so a second official source for the same
+metric is worth more than a tenth reprint of the first.
 
 CANDIDATES:
 ${JSON.stringify(listing, null, 2)}
@@ -507,9 +598,12 @@ export function observationsFromRows(input: {
   );
 }
 
-export function mergeAndVerify(all: Observation[], metric: string): { observations: Observation[]; conflicts: ReturnType<typeof verifyAcrossSources>['conflicts'] } {
+export function mergeAndVerify(
+  all: Observation[],
+  metric: string,
+): { observations: Observation[]; conflicts: ReturnType<typeof verifyAcrossSources>['conflicts']; notes: string[] } {
   const result = verifyAcrossSources(all, { metric });
-  return { observations: result.observations, conflicts: result.conflicts };
+  return { observations: result.observations, conflicts: result.conflicts, notes: result.notes };
 }
 
 export type { FrameOptions };
@@ -544,6 +638,12 @@ ${JSON.stringify({ topic: plan.topic, metric: plan.metric, entityType: plan.enti
 Design the research. Prefer, in this order: official APIs, official datasets, government statistics,
 then a reputable public dataset. Name the endpoints you actually expect to exist; do not invent URLs
 you are unsure about.
+
+Verification needs at least two INDEPENDENT publishers for the same metric:
+include at least two queries designed to find a corroborating source (a different
+publisher, ideally an official one) for the top entities - e.g. "UNdata <metric>
+<entity> annual" alongside the World Bank query. One dataset echoed on ten blogs
+is one source, not ten.
 
 Reply with JSON only:
 {
@@ -664,6 +764,13 @@ ${JSON.stringify(briefs, null, 2)}
 Rules:
 - Prefer an official API or official dataset over an aggregator; prefer machine-readable over prose.
 - Reject pages that only mention numbers, are paywalled, or have no licence we could check.
+- Check the metric definition: reject sources whose numbers measure something
+  different from the plan (totals vs per-capita, current vs constant prices,
+  estimates vs recorded values). A source with the wrong definition is worse
+  than no source.
+- Prefer picking at least two independent publishers whose data overlaps the
+  same entities and years: overlap across publishers is what lets rows be
+  verified instead of merely supported.
 - If a candidate page links to a downloadable CSV/JSON/API endpoint, put that exact URL in "directDataUrl".
 - Only propose URLs you can see in the excerpts. Do not invent links.
 
@@ -728,6 +835,8 @@ export interface ExtractedRow {
   value: number | null;
   unit?: string;
   quote: string;
+  /** Anything that weakens this row: estimated, rounded, preliminary, projection, ambiguous wording on the page. */
+  caveat?: string;
 }
 
 export interface TextExtraction {
@@ -767,12 +876,31 @@ Hard rules:
 - Every row needs a "quote": an exact substring copied from the page text that contains the number.
 - If the page does not contain the metric over time, return an empty rows array. That is a valid answer.
 - Do not compute, convert, estimate or interpolate anything.
-- Use the unit the page uses (e.g. "million", "percent", "count").
+- Use the unit the page uses, exactly as written (e.g. "million", "percent", "count", "$").
+  If the page scales numbers with a word ("5.2 million"), keep value 5.2 and unit "million".
+- In "notes", state the unit the page uses for this metric, in the page's own words
+  (e.g. "the page reports GDP in current US dollars, millions"). If the page never
+  states a unit, say so explicitly - do not guess one.
+- Dates must be exact. If the page gives only a vague period ("early 2000s", "recently")
+  with no exact year, refuse that row: emit nothing rather than guess a date.
+- If the page marks a number as estimated, rounded, preliminary or a projection,
+  keep the row but say so in "caveat" and in notes.
+- One row per entity per date. If a page mentions the same cell twice, keep the
+  first and drop the rest.
+- If the same entity/date cell appears with two different units, report BOTH
+  rows with their own units - do not convert between them and do not pick one
+  silently. The verifier compares units explicitly.
+- Never invent an entity name: use the name exactly as written on the page.
+- Skip aggregate rows ("World", "Total", "EU", "All countries") unless the plan
+  is about aggregates.
+- Dates must be within the plan's time range when possible; if a row falls
+  outside it, keep it but say so in "notes".
+- If a number in the page has a digit the quote does not contain, do not emit the row.
 
 Reply with JSON only:
 {
-  "rows": [ { "entity": "...", "date": "1960 or 1960-05", "value": 123.4, "unit": "...", "quote": "exact text from the page" } ],
-  "notes": ["anything the analyst should know about this page"]
+  "rows": [ { "entity": "...", "date": "1960 or 1960-05", "value": 123.4, "unit": "...", "quote": "exact text from the page", "caveat": "optional: estimated/rounded/preliminary/projection, or omit" } ],
+  "notes": ["anything the analyst should know about this page; always include the page's unit for the metric, in its own words"]
 }`;
 
   const extraction: TextExtraction = { rows: [], dropped: 0, notes: [] };
@@ -783,6 +911,7 @@ Reply with JSON only:
       'extractedRows',
     );
     extraction.notes = (parsed.notes ?? []).filter((n) => typeof n === 'string').slice(0, 5);
+    const seenCells = new Set<string>();
     for (const row of parsed.rows ?? []) {
       if (!row || typeof row.entity !== 'string' || typeof row.date !== 'string') {
         extraction.dropped += 1;
@@ -803,7 +932,18 @@ Reply with JSON only:
           continue;
         }
       }
-      extraction.rows.push({ entity: row.entity.trim(), date: row.date.trim(), value: row.value ?? null, unit: row.unit, quote });
+      // One row per entity/date cell: a page that mentions the same cell twice
+      // does not get two votes.
+      const cellKey = `${row.entity.trim().toLowerCase()}|${row.date.trim()}`;
+      if (seenCells.has(cellKey)) {
+        extraction.dropped += 1;
+        continue;
+      }
+      seenCells.add(cellKey);
+      // Normalise the unit word so downstream comparison is unit-aware.
+      const rawUnit = typeof row.unit === 'string' ? row.unit.trim() : '';
+      const unit = /^%|percent/i.test(rawUnit) ? 'percent' : rawUnit || 'count';
+      extraction.rows.push({ entity: row.entity.trim(), date: row.date.trim(), value: row.value ?? null, unit, quote, caveat: typeof row.caveat === 'string' && row.caveat.trim() ? row.caveat.trim() : undefined });
     }
     logRun(ctx, 'text-extractor', meta.url, { kept: extraction.rows.length, dropped: extraction.dropped }, 'role:extractor');
   } catch (error) {

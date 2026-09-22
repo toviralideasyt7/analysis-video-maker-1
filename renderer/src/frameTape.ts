@@ -9,6 +9,12 @@ export interface FrameTapeEntity {
   logo?: string;
   image?: string;
   group?: string;
+  /**
+   * Optional data-URI (`data:image/png;base64,...`) for the entity flag,
+   * populated by the render CLI so frames never depend on flag CDNs at
+   * render time. Components prefer this over `flagBaseUrl` + `flagCode`.
+   */
+  flagDataUri?: string;
 }
 
 export interface FrameTapeBar {

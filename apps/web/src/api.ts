@@ -106,4 +106,6 @@ export const api = {
     }),
   patchDataset: (id: string, body: Record<string, unknown>) =>
     request<{ dataset: Dataset }>(`/api/projects/${id}/dataset`, { method: 'PATCH', body: JSON.stringify(body) }),
+  listRenders: () =>
+    request<{ renders: Array<{ filename: string; title: string; sizeBytes: number; createdAt: string; url: string }> }>('/api/renders'),
 };

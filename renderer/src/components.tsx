@@ -110,22 +110,58 @@ export const LogoBadge: React.FC<{ name: string; color: string; size?: number; i
 
 export interface RankingRowProps {
   entity: FrameTapeEntity;
-  bar: FrameTapeBar;
-  theme: Theme;
-  maxWidth: number;
-  widthFraction: number;
-  rowHeight: number;
+  /** Interpolated bar state in render space. */
+  value: number;
+  widthFrac: number;
+  rank: number;
+  held: boolean;
   unit: string;
   y: number;
+  rowHeight: number;
+  maxBarWidth: number;
   appear: number;
+  flagBaseUrl: string;
 }
 
-/** One horizontal ranking bar: name + flag, the bar itself, then the value. */
-export const RankingRow: React.FC<RankingRowProps> = ({ entity, bar, theme, maxWidth, widthFraction, rowHeight, unit, y, appear }) => {
-  // Percentage of the track, not an absolute width: a ~100% bar must not
-  // overflow the track and cover the value column beside it.
-  const widthPercent = `${Math.max(1.5, Math.min(100, widthFraction * 100)).toFixed(2)}%`;
-  void maxWidth;
+/**
+ * One full-bleed ranking bar, in the classic data-race style:
+ * the bar runs from the left edge, the entity name sits in white bold type
+ * inside the bar (right-aligned near the bar end), the flag image is attached
+ * to the bar end, and the value is set in dark type just past the flag.
+ */
+export const RankingRow: React.FC<RankingRowProps> = ({
+  entity,
+  value,
+  widthFrac,
+  held,
+  unit,
+  y,
+  rowHeight,
+  maxBarWidth,
+  appear,
+  flagBaseUrl,
+}) => {
+  const barHeight = rowHeight - 5;
+  // Never let a bar get so thin the white name becomes unreadable.
+  const barW = Math.max(96, widthFrac * maxBarWidth);
+  const baseFont = rowHeight * 0.5;
+  const flagSize = Math.min(rowHeight * 0.82, 52);
+  const valueFont = rowHeight * 0.44;
+
+  // Does the name fit inside the bar at a readable size? Estimate width with
+  // a 0.58 average glyph ratio for bold type. If it can't fit even at the
+  // minimum readable size, the name moves outside the bar (past the value)
+  // in dark type instead of being clipped or shrunk to illegibility.
+  const MIN_INSIDE_FONT = 22;
+  const estimateWidth = (fontSize: number) => entity.name.length * fontSize * 0.58;
+  const insideAvailable = barW - 28; // 14px padding on each side
+  let insideFont = baseFont;
+  if (estimateWidth(baseFont) > insideAvailable) {
+    insideFont = Math.max(MIN_INSIDE_FONT, (insideAvailable / Math.max(1, entity.name.length)) * 1.72);
+  }
+  const nameFitsInside = estimateWidth(insideFont) <= insideAvailable && insideFont >= MIN_INSIDE_FONT;
+  const nameFont = nameFitsInside ? Math.min(baseFont, insideFont) : baseFont;
+
   return (
     <div
       style={{
@@ -134,56 +170,177 @@ export const RankingRow: React.FC<RankingRowProps> = ({ entity, bar, theme, maxW
         top: y,
         height: rowHeight,
         width: '100%',
-        display: 'flex',
-        alignItems: 'center',
-        gap: rowHeight * 0.26,
         opacity: appear,
-        transform: `translateY(${(1 - appear) * 14}px)`,
+        transform: `translateY(${(1 - appear) * 12}px)`,
       }}
     >
-      {/* identity: name + flag, right-aligned against the bars */}
-      <div style={{ width: 258, display: 'flex', alignItems: 'center', gap: rowHeight * 0.22, justifyContent: 'flex-end', flex: '0 0 auto' }}>
-        <div style={{ fontSize: rowHeight * 0.44, fontWeight: 700, color: theme.primaryText, whiteSpace: 'nowrap' }}>{entity.name}</div>
-        <FlagChip code={entity.flagCode} label={entity.flag ?? entity.group} theme={theme} size={rowHeight * 0.56} />
-      </div>
-
       {/* bar */}
-      <div style={{ position: 'relative', flex: 1, height: rowHeight * 0.72 }}>
-        <div style={{ position: 'absolute', inset: 0, background: theme.barTrack, borderRadius: rowHeight * 0.16 }} />
-        <div
-          style={{
-            position: 'absolute',
-            left: 0,
-            top: 0,
-            bottom: 0,
-            width: widthPercent,
-            background: entity.color,
-            borderRadius: rowHeight * 0.16,
-            opacity: bar.held ? 0.55 : 1,
-          }}
-        />
-        <div style={{ position: 'absolute', left: rowHeight * 0.26, top: 0, bottom: 0, display: 'flex', alignItems: 'center' }}>
-          <LogoBadge name={entity.name} color={entity.color} size={rowHeight * 0.5} invert />
-        </div>
-      </div>
-
-      {/* value: a fixed column, so every number lines up across rows */}
       <div
         style={{
-          width: 132,
-          flex: '0 0 auto',
-          textAlign: 'right',
-          fontSize: rowHeight * 0.44,
-          fontWeight: 800,
-          color: theme.primaryText,
-          fontVariantNumeric: 'tabular-nums',
+          position: 'absolute',
+          left: 0,
+          top: (rowHeight - barHeight) / 2,
+          height: barHeight,
+          width: barW,
+          background: entity.color,
+          opacity: held ? 0.55 : 1,
         }}
       >
-        {formatValue(bar.value, unit)}
+        {/* name: white bold, right-aligned inside the bar (only when it fits) */}
+        {nameFitsInside ? (
+          <div
+            style={{
+              position: 'absolute',
+              right: 14,
+              top: 0,
+              bottom: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              whiteSpace: 'nowrap',
+              color: '#ffffff',
+              fontWeight: 800,
+              fontSize: nameFont,
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {entity.name}
+          </div>
+        ) : null}
+      </div>
+
+      {/* flag + value + (outside name when it can't fit inside), in one row */}
+      <div
+        style={{
+          position: 'absolute',
+          left: barW - 2,
+          top: 0,
+          bottom: 0,
+          display: 'flex',
+          alignItems: 'center',
+        }}
+      >
+        {entity.flagCode || entity.flagDataUri ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={entity.flagDataUri ?? `${flagBaseUrl}/w80/${entity.flagCode}.png`}
+            style={{
+              height: flagSize,
+              marginRight: 12,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.25)',
+            }}
+          />
+        ) : (
+          <div style={{ marginRight: 12 }}>
+            <LogoBadge name={entity.name} color={entity.color} size={flagSize} invert />
+          </div>
+        )}
+
+        {/* value in dark type past the flag */}
+        <div
+          style={{
+            whiteSpace: 'nowrap',
+            fontSize: valueFont,
+            fontWeight: 700,
+            color: '#1f2937',
+            fontVariantNumeric: 'tabular-nums',
+            marginRight: nameFitsInside ? 0 : 14,
+          }}
+        >
+          {formatRaceValue(value, unit)}
+        </div>
+
+        {/* name outside the bar when too narrow to hold it */}
+        {!nameFitsInside ? (
+          <div
+            style={{
+              whiteSpace: 'nowrap',
+              color: '#1f2937',
+              fontWeight: 800,
+              fontSize: nameFont,
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {entity.name}
+          </div>
+        ) : null}
       </div>
     </div>
   );
 };
+
+/** Race-style value formatting: full numbers with separators, like the reference. */
+export function formatRaceValue(value: number, unit: string): string {
+  if (!Number.isFinite(value)) return '-';
+  if (unit === 'percent') return `${value.toFixed(2)}%`;
+  if (unit === 'currency') return `$${Math.round(value).toLocaleString('en-US')}`;
+  if (unit === 'count') return Math.round(value).toLocaleString('en-US');
+  return compactNumber(value);
+}
+
+/**
+ * Insert thousand separators into bare long digit runs inside narrative text
+ * (e.g. story copy like "a population of 667070000" renders as "667,070,000").
+ * Years (4 digits) and already-separated numbers are left untouched.
+ */
+export function formatNarrativeNumbers(text: string): string {
+  return text.replace(/\b\d{5,}\b/g, (m) => Number(m).toLocaleString('en-US'));
+}
+
+// ---------------------------------------------------------------------------
+// Era panel (the right-hand column: giant year, era title, narrative, flags)
+// ---------------------------------------------------------------------------
+
+export interface EraPanelProps {
+  yearLabel: string;
+  title?: string;
+  body?: string;
+  featured: FrameTapeEntity[];
+  flagBaseUrl: string;
+  appear: number;
+}
+
+/** The right-hand panel from the reference layout. */
+export const EraPanel: React.FC<EraPanelProps> = ({ yearLabel, title, body, featured, flagBaseUrl, appear }) => (
+  <div style={{ position: 'absolute', left: 968, top: 228, width: 292, opacity: appear }}>
+    <div
+      style={{
+        fontSize: 138,
+        fontWeight: 800,
+        color: '#b4b4b4',
+        letterSpacing: '-0.04em',
+        lineHeight: 1,
+        fontVariantNumeric: 'tabular-nums',
+      }}
+    >
+      {yearLabel}
+    </div>
+    {title ? (
+      <div style={{ marginTop: 10, fontSize: 34, fontWeight: 800, color: '#111111', lineHeight: 1.15, letterSpacing: '-0.02em' }}>
+        {title}
+      </div>
+    ) : null}
+    {body ? (
+      <div style={{ marginTop: 14, fontSize: 23, fontWeight: 500, color: '#5c5c5c', lineHeight: 1.42 }}>{formatNarrativeNumbers(body)}</div>
+    ) : null}
+    {featured.length > 0 ? (
+      <div style={{ marginTop: 22, display: 'flex', gap: 14 }}>
+        {featured.slice(0, 2).map((entity) =>
+          entity.flagCode || entity.flagDataUri ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              key={entity.id}
+              src={entity.flagDataUri ?? `${flagBaseUrl}/w160/${entity.flagCode}.png`}
+              style={{ height: 92, boxShadow: '0 2px 8px rgba(0,0,0,0.22)' }}
+            />
+          ) : (
+            <LogoBadge key={entity.id} name={entity.name} color={entity.color} size={92} />
+          ),
+        )}
+      </div>
+    ) : null}
+  </div>
+);
 
 /** Share gauge: the leader's slice of the visible total. */
 export const ShareGauge: React.FC<{ fraction: number; label: string; theme: Theme; color: string; width: number; appear: number }> = ({

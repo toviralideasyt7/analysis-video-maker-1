@@ -6,7 +6,7 @@ export function demoInput(): RenderInput {
   const videoSpec = {
     version: '1.0' as const,
     metadata: { title: 'Demo', subtitle: 'placeholder', language: 'en', durationSeconds: 5 },
-    canvas: { width: 1280, height: 720, fps: 30 },
+    canvas: { width: 1280, height: 720, fps: 60 },
     theme: { background: '#ffffff', primaryText: '#111827', fontFamily: 'Inter' },
     datasetRef: 'demo',
     scenes: [{ id: 's1', type: 'bar_race' as const, duration: 5 }],
@@ -32,7 +32,7 @@ export function demoInput(): RenderInput {
       createdAt: new Date(0).toISOString(),
     },
     frameTape: {
-      fps: 30,
+      fps: 60,
       width: 1280,
       height: 720,
       topN: 10,

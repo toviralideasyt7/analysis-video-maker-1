@@ -16,13 +16,14 @@ export const RemotionRoot: React.FC = () => (
       id="DataRace"
       component={DataRace}
       durationInFrames={300}
-      fps={30}
+      fps={60}
       width={1280}
       height={720}
       defaultProps={{ input: demoInput() }}
       calculateMetadata={({ props, defaultProps }) => {
         const input = (props as { input?: RenderInput }).input ?? (defaultProps as { input: RenderInput }).input;
-        const fps = input.videoSpec.canvas.fps || 30;
+        // The rebuilt renderer targets 60fps output; ignore any legacy fps in the spec.
+        const fps = 60;
         const frames = Math.max(1, Math.round(input.videoSpec.metadata.durationSeconds * fps));
         return {
           durationInFrames: frames,
@@ -36,7 +37,7 @@ export const RemotionRoot: React.FC = () => (
       id="Thumbnail"
       component={Thumbnail}
       durationInFrames={1}
-      fps={30}
+      fps={60}
       width={1280}
       height={720}
       defaultProps={{ input: demoInput() }}

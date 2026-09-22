@@ -277,6 +277,74 @@ app.post('/api/uploads', async (c) => {
 
 app.get('/api/ideas', (c) => c.json({ ideas: [] }));
 
+/** Local video renders gallery: list MP4s in the renders/ directory. */
+import { readdirSync, statSync, existsSync } from 'node:fs';
+import { join, basename } from 'node:path';
+
+function rendersDir(): string {
+  // server.ts lives in services/orchestrator/src; renders/ is at repo root.
+  return join(__dirname, '..', '..', '..', 'renders');
+}
+
+app.get('/api/renders', (c) => {
+  const dir = rendersDir();
+  if (!existsSync(dir)) return c.json({ renders: [] });
+  const renders = readdirSync(dir)
+    .filter((f) => f.toLowerCase().endsWith('.mp4'))
+    .map((f) => {
+      const full = join(dir, f);
+      const stat = statSync(full);
+      return {
+        filename: f,
+        title: basename(f, '.mp4').replace(/[-_]/g, ' '),
+        sizeBytes: stat.size,
+        createdAt: stat.mtime.toISOString(),
+        url: `/api/renders/file/${encodeURIComponent(f)}`,
+      };
+    })
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  return c.json({ renders });
+});
+
+/** Stream a local render file (supports range requests for seeking). */
+app.get('/api/renders/file/:filename', async (c) => {
+  const filename = c.req.param('filename');
+  // Prevent path traversal.
+  if (!filename || filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+    return c.json({ error: 'invalid filename' }, 400);
+  }
+  if (!filename.toLowerCase().endsWith('.mp4')) return c.json({ error: 'not a video' }, 400);
+  const full = join(rendersDir(), filename);
+  if (!existsSync(full)) return c.json({ error: 'not found' }, 404);
+  const stat = statSync(full);
+  const range = c.req.header('range');
+  const { createReadStream } = await import('node:fs');
+  if (range) {
+    const match = /bytes=(\d+)-(\d*)/.exec(range);
+    const start = match ? Number(match[1]) : 0;
+    const end = match && match[2] ? Number(match[2]) : stat.size - 1;
+    const clampedEnd = Math.min(end, stat.size - 1);
+    const stream = createReadStream(full, { start, end: clampedEnd });
+    return new Response(stream as unknown as ReadableStream, {
+      status: 206,
+      headers: {
+        'Content-Type': 'video/mp4',
+        'Content-Length': String(clampedEnd - start + 1),
+        'Content-Range': `bytes ${start}-${clampedEnd}/${stat.size}`,
+        'Accept-Ranges': 'bytes',
+      },
+    });
+  }
+  const stream = createReadStream(full);
+  return new Response(stream as unknown as ReadableStream, {
+    headers: {
+      'Content-Type': 'video/mp4',
+      'Content-Length': String(stat.size),
+      'Accept-Ranges': 'bytes',
+    },
+  });
+});
+
 function readState(id: string): ProjectState | null {
   try {
     return store.load(id);

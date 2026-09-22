@@ -20,17 +20,23 @@ import type {
 } from '@avm/shared';
 import type { FrameTape } from './pipeline';
 import {
+  aliasEntityName,
   buildDataset,
   buildFrameTape,
   dataQualityReport,
   datasetToCoreInput,
   deterministicStory,
   inferFrequency,
+  majorityUnit,
   observedTimeRange,
+  parseScaledNumber,
   resolveEntities,
   scoreCandidates,
   sourceQualityScore,
+  sanitizeObservations,
+  stripCorporateSuffix,
   typescriptQualityReport,
+  verificationSummary,
   verifyAcrossSources,
   type FrameOptions,
 } from './pipeline';
@@ -54,6 +60,7 @@ import {
   huntSources,
   judgeSources,
   planTopic,
+  qaCheck,
   selectBestSources,
   type AgentContext,
   type SourceSelection,
@@ -221,23 +228,52 @@ export interface ExtractionResult {
 }
 
 /** Pick entity/date/value columns from an arbitrary table, refusing to guess. */
-export function detectColumns(columns: string[]): { entity?: string; date?: string; value?: string } {
+export function detectColumns(
+  columns: string[],
+  sampleRows: string[][] = [],
+): { entity?: string; date?: string; value?: string; valueGuessed: boolean } {
   const lower = columns.map((c) => c.toLowerCase());
-  const entityIndex = lower.findIndex((c) => ['entity', 'country', 'name', 'region', 'brand', 'company', 'item'].includes(c));
-  const dateIndex = lower.findIndex((c) => ['year', 'date', 'time', 'period'].includes(c));
+  const entityIndex = lower.findIndex((c) => ['entity', 'country', 'country name', 'name', 'region', 'territory', 'location', 'geo', 'geography', 'state', 'nation', 'brand', 'company', 'item', 'product', 'label'].includes(c));
+  const dateIndex = lower.findIndex((c) => ['year', 'date', 'time', 'period', 'month', 'quarter', 'day', 'datetime', 'fiscal year'].includes(c));
   const entity = entityIndex >= 0 ? columns[entityIndex] : undefined;
   const date = dateIndex >= 0 ? columns[dateIndex] : undefined;
-  const reserved = new Set([entity, date, 'code', 'iso', 'iso3', 'continent', 'flag']);
-  const numericCandidates: Array<{ name: string; hits: number }> = [];
+  const reserved = new Set(
+    [entity, date, 'code', 'iso', 'iso3', 'iso_code', 'slug', 'continent', 'flag', 'entity_id']
+      .filter((c): c is string => typeof c === 'string')
+      .map((c) => c.toLowerCase()),
+  );
+
+  // Data-driven scoring: sample the rows and score each free column by how
+  // many of its values parse as numbers. A column named "value" that holds
+  // text is a worse pick than an oddly-named column full of numbers.
+  const sample = sampleRows.slice(0, 50);
+  const numericScore = new Map<string, number>();
   for (const column of columns) {
-    if (!column || reserved.has(column)) continue;
-    lower.includes(column.toLowerCase());
-    numericCandidates.push({ name: column, hits: 0 });
+    if (!column || reserved.has(column.toLowerCase())) continue;
+    const idx = columns.indexOf(column);
+    let numeric = 0;
+    let total = 0;
+    for (const row of sample) {
+      const cell = (row[idx] ?? '').trim();
+      if (cell.length === 0) continue;
+      total += 1;
+      if (parseScaledNumber(cell).value !== null) numeric += 1;
+    }
+    numericScore.set(column, total > 0 ? numeric / total : 0);
   }
-  // Prefer a column whose name looks like a measurement.
-  const value = numericCandidates.map((c) => c.name).find((c) => /(value|population|total|amount|count|number|sales|users|spend|gdp|production|share|percent|rate|emission)/i.test(c))
-    ?? numericCandidates[0]?.name;
-  return { entity, date, value };
+
+  const numericCandidates = [...numericScore.entries()]
+    .filter(([, score]) => score >= 0.5)
+    .sort((a, b) => b[1] - a[1])
+    .map(([name]) => name);
+
+  // Prefer a column whose name looks like a measurement, but only among
+  // columns that actually hold numbers.
+  const preferred = numericCandidates.find((c) =>
+    /(value|population|total|amount|count|number|sales|users|spend|gdp|production|share|percent|rate|emission|revenue|profit|income|deaths|cases|capacity|output|volume|headcount|customers)/i.test(c),
+  );
+  const value = preferred ?? numericCandidates[0];
+  return { entity, date, value, valueGuessed: preferred === undefined };
 }
 
 export interface ExtractedDraft {
@@ -290,10 +326,13 @@ export async function normalizeDrafts(drafts: ExtractedDraft[], defaultUnit: str
 /** Extract observations from a connector payload. */
 export function draftsFromTable(columns: string[], rows: string[][], defaultUnit: string): { drafts: ExtractedDraft[]; problems: string[] } {
   const problems: string[] = [];
-  const detected = detectColumns(columns);
+  const detected = detectColumns(columns, rows);
   if (!detected.entity || !detected.date || !detected.value) {
     problems.push(`could not identify entity/date/value columns in [${columns.join(', ')}]`);
     return { drafts: [], problems };
+  }
+  if (detected.valueGuessed) {
+    problems.push(`value column "${detected.value}" was chosen by fallback (first free column) - verify it is the metric column`);
   }
   const ci = {
     entity: columns.indexOf(detected.entity),
@@ -301,18 +340,94 @@ export function draftsFromTable(columns: string[], rows: string[][], defaultUnit
     value: columns.indexOf(detected.value),
   };
   const drafts: ExtractedDraft[] = [];
+  let skippedBlank = 0;
+  let skippedBadDate = 0;
   for (const row of rows) {
-    const entity = (row[ci.entity] ?? '').trim();
+    const entity = stripCorporateSuffix((row[ci.entity] ?? '').trim());
     const date = (row[ci.date] ?? '').trim();
-    const rawValue = (row[ci.value] ?? '').trim().replace(/[",%\s]/g, '');
-    if (!entity || !date) continue;
-    const value = rawValue === '' ? null : Number.parseFloat(rawValue);
-    drafts.push({ entity, date, value: value !== null && Number.isFinite(value) ? value : null, unit: defaultUnit });
+    const rawValue = (row[ci.value] ?? '').trim();
+    if (!entity || !date) {
+      skippedBlank += 1;
+      continue;
+    }
+    if (!looksLikeDate(date)) {
+      skippedBadDate += 1;
+      continue;
+    }
+    // Scale-aware parse: "1.2M" -> 1_200_000, "$45.2bn" -> 45_200_000_000,
+    // "37%" -> 37 with a percent unit. Never let a suffix silently divide a value.
+    const parsed = parseScaledNumber(rawValue);
+    const value = parsed.value !== null && Number.isFinite(parsed.value) ? parsed.value : null;
+    const unit = parsed.unitHint ?? defaultUnit;
+    drafts.push({ entity, date, value, unit });
   }
+  if (skippedBlank > 0) problems.push(`skipped ${skippedBlank} rows with a blank entity or date`);
+  if (skippedBadDate > 0) problems.push(`skipped ${skippedBadDate} rows with an unparseable date`);
   return { drafts, problems };
 }
 
-/** Deterministic World Bank indicator discovery by name matching. */
+/** Dates we accept without asking: year, year-month, full date, quarter, month names. */
+function looksLikeDate(date: string): boolean {
+  const d = date.trim();
+  if (/^\d{4}(-\d{2}(-\d{2})?)?$/.test(d)) return true;
+  if (/^\d{4}-Q[1-4]$/.test(d)) return true;
+  if (/^Q[1-4]\s*\d{4}$/i.test(d)) return true;
+  if (/^\d{4}\/\d{1,2}(\/\d{1,2})?$/.test(d)) return true;
+  if (/^\d{1,2}\/\d{4}$/.test(d)) return true;
+  if (/^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{4}$/i.test(d)) return true;
+  if (/^\d{4}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*$/i.test(d)) return true;
+  return false;
+}
+
+/**
+ * Pull the measurement unit out of an OWID grapher metadata sidecar.
+ * The shape varies by chart, so this tries the known paths defensively and
+ * returns null when nothing trustworthy is found - callers keep 'count'.
+ */
+export function owidUnitFromMetadata(metadata: unknown): string | null {
+  try {
+    const node = metadata as Record<string, unknown> | null;
+    if (!node || typeof node !== 'object') return null;
+    const dims = (node.dimensions ?? node.columns ?? []) as Array<Record<string, unknown>>;
+    const first = Array.isArray(dims) ? dims[0] : null;
+    const candidates = [
+      first?.display && typeof first.display === 'object' ? (first.display as Record<string, unknown>).unit : undefined,
+      first?.unit,
+      node.unit,
+    ];
+    for (const c of candidates) {
+      if (typeof c === 'string' && c.trim().length > 0) return c.trim();
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
+/**
+ * Guess the unit from a World Bank indicator name: indicators ending in "%"
+ * or named like "… (% of …)" are percentages; "… (current US$)" style names
+ * are currency. Anything else keeps 'count'.
+ */
+export function worldBankUnitFromName(indicatorName: string): string {
+  const name = indicatorName.toLowerCase();
+  if (/\(%|%\s*of|percent/.test(name)) return 'percent';
+  if (/us\$|\$|dollar|gdp|gni/.test(name)) return 'USD';
+  return 'count';
+}
+
+/**
+ * Deterministic World Bank indicator discovery by name matching.
+ *
+ * Matching is word-level (a token must appear as a whole word in the
+ * indicator name) with light plural normalisation, because raw substring
+ * matching made "car" hit "health care" while plural tokens like
+ * "countries" never matched "country". Candidates rank by matched token
+ * count first, then coverage, then name specificity (shorter wins ties):
+ * for "world population by country" the right indicator ("Population,
+ * total") covers 1 of 2 tokens and must not be rejected by a strict
+ * above-50% cutoff.
+ */
 export async function findWorldBankIndicator(metric: string): Promise<{ id: string; name: string } | null> {
   const { getJson } = await import('./connectors');
   const page = await getJson<unknown[]>('https://api.worldbank.org/v2/indicator?format=json&per_page=25000', { timeoutMs: 90_000 });
@@ -323,14 +438,30 @@ export async function findWorldBankIndicator(metric: string): Promise<{ id: stri
     .toLowerCase()
     .split(/[^a-z0-9]+/)
     .filter((t) => t.length > 2 && !stop.has(t));
-  let best: { id: string; name: string; score: number } | null = null;
+  if (tokens.length === 0) return null;
+  // Light plural normalisation so "countries" matches "country" and
+  // "populations" matches "population".
+  const singular = (t: string): string => {
+    if (t.endsWith('ies') && t.length > 4) return t.slice(0, -3) + 'y';
+    if (t.endsWith('ses') && t.length > 4) return t.slice(0, -2);
+    if (t.endsWith('s') && !t.endsWith('ss') && t.length > 3) return t.slice(0, -1);
+    return t;
+  };
+  let best: { id: string; name: string; matched: number; score: number } | null = null;
   for (const indicator of indicators) {
     if (!indicator.id || !indicator.name) continue;
-    const name = indicator.name.toLowerCase();
-    let score = 0;
-    for (const token of tokens) if (name.includes(token)) score += 1;
-    if (tokens.length > 0) score = score / tokens.length;
-    if (score > 0.5 && (!best || score > best.score)) best = { id: indicator.id, name: indicator.name, score };
+    const words = new Set(indicator.name.toLowerCase().split(/[^a-z0-9]+/));
+    let matched = 0;
+    for (const token of tokens) {
+      if (words.has(token) || words.has(singular(token))) matched += 1;
+    }
+    const score = matched / tokens.length;
+    if (matched === 0) continue;
+    const better =
+      !best ||
+      matched > best.matched ||
+      (matched === best.matched && (score > best.score || (score === best.score && indicator.name.length < best.name.length)));
+    if (score >= 0.5 && better) best = { id: indicator.id, name: indicator.name, matched, score };
   }
   return best ? { id: best.id, name: best.name } : null;
 }
@@ -341,18 +472,25 @@ export async function findWorldBankIndicator(metric: string): Promise<{ id: stri
  * This is what keeps World Bank aggregates ("Arab World", "Euro area", "World")
  * out of a country race - without it the ranking would be dominated by rows that
  * are not countries at all.
+ *
+ * When the Rust resolver is unavailable, the pure-TS alias map
+ * (aliasEntityName) still merges the common name variants so cross-source
+ * verification and ranking do not split "USA" from "United States".
  */
 export async function canonicalizeDrafts(drafts: ExtractedDraft[], options: { countryOnly: boolean }): Promise<ExtractedDraft[]> {
   if (drafts.length === 0) return [];
   const names = Array.from(new Set(drafts.map((d) => d.entity)));
   const resolution = await resolveEntities(names);
-  if (resolution.size === 0) return drafts;
+  const useFallback = resolution.size === 0;
+  if (useFallback) {
+    logger.warn('entity resolution unavailable; falling back to the TypeScript alias map');
+  }
   const out: ExtractedDraft[] = [];
   let dropped = 0;
   for (const draft of drafts) {
     const resolved = resolution.get(draft.entity);
-    if (!resolved) {
-      out.push(draft);
+    if (useFallback || !resolved) {
+      out.push({ ...draft, entity: aliasEntityName(draft.entity) });
       continue;
     }
     // A real country resolves AND has a fetchable flag code. That is exactly
@@ -513,19 +651,31 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
   const collected: Observation[] = [];
   const extractionNotes: string[] = [];
 
-  const wantedIndicator =
-    options.worldBankIndicator ?? (await findWorldBankIndicator(plan.metric).catch(() => null))?.id;
+  const wbIndicator = options.worldBankIndicator
+    ? { id: options.worldBankIndicator, name: options.worldBankIndicator }
+    : await findWorldBankIndicator(plan.metric).catch(() => null);
+  const wantedIndicator = wbIndicator?.id ?? null;
+  const wantedIndicatorUnit = wbIndicator ? worldBankUnitFromName(wbIndicator.name) : 'count';
+
+  // Each distinct data URL is extracted exactly once. The picker data-URL loop
+  // and the CSV-candidate sweep below can otherwise hit the same file twice,
+  // wasting budget and duplicating every observation from it.
+  const extractedUrls = new Set<string>();
 
   if (options.owidSlug) {
     try {
       const owid = await owidFetch(options.owidSlug);
-      const { drafts: owidDrafts, problems } = draftsFromTable(owid.columns, owid.rows, 'count');
+      // The metadata sidecar carries the unit (percent, index, count...);
+      // trusting it beats the old hardcoded 'count'.
+      const owidUnit = owidUnitFromMetadata(owid.metadata) ?? 'count';
+      const { drafts: owidDrafts, problems } = draftsFromTable(owid.columns, owid.rows, owidUnit);
       extractionNotes.push(...problems);
       const drafts = await canonicalizeDrafts(owidDrafts, { countryOnly: plan.entityType === 'country' });
-      const normalized = await normalizeDrafts(drafts, 'count');
+      const normalized = await normalizeDrafts(drafts, owidUnit);
       const candidate = state.sources.find((s) => s.candidateId === owid.candidate.candidateId) ?? owid.candidate;
       collected.push(...normalized.map((d) => toObservation(d, candidate, timeRange)));
-      extractionNotes.push(`OWID ${options.owidSlug}: ${normalized.length} observations`);
+      extractedUrls.add(candidate.url);
+      extractionNotes.push(`OWID ${options.owidSlug}: ${normalized.length} observations (unit: ${owidUnit})`);
     } catch (error) {
       errors.push(`OWID extraction: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -539,12 +689,13 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
       });
       const rawDrafts: ExtractedDraft[] = wb.rows
         .filter((r) => r.value !== null && r.countryIso3 && r.countryIso3 !== 'WLD')
-        .map((r) => ({ entity: r.countryName, date: r.date, value: r.value, unit: 'count' }));
+        .map((r) => ({ entity: r.countryName, date: r.date, value: r.value, unit: wantedIndicatorUnit }));
       const drafts = await canonicalizeDrafts(rawDrafts, { countryOnly: true });
-      const normalized = await normalizeDrafts(drafts, 'count');
+      const normalized = await normalizeDrafts(drafts, wantedIndicatorUnit);
       const candidate = state.sources.find((s) => s.candidateId === wb.candidate.candidateId) ?? wb.candidate;
       collected.push(...normalized.map((d) => toObservation(d, candidate, timeRange)));
-      extractionNotes.push(`World Bank ${wantedIndicator}: ${normalized.length} observations`);
+      extractedUrls.add(candidate.url);
+      extractionNotes.push(`World Bank ${wantedIndicator}: ${normalized.length} observations (unit: ${wantedIndicatorUnit})`);
     } catch (error) {
       errors.push(`World Bank extraction: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -553,6 +704,10 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
   // URLs the picker verified in the pages it actually read.
   for (const dataUrl of selection.dataUrls.slice(0, 5)) {
     if (ctx.budget.exhausted()) break;
+    if (extractedUrls.has(dataUrl)) {
+      extractionNotes.push(`picker data URL ${dataUrl}: skipped, already extracted`);
+      continue;
+    }
     try {
       const fetched = await ctx.search.fetch(dataUrl);
       const text = fetched.text ?? '';
@@ -596,6 +751,7 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
           discoveredBy: 'source-picker',
         } as SourceCandidate);
       collected.push(...normalized.map((d) => toObservation(d, candidate, timeRange)));
+      extractedUrls.add(dataUrl);
       extractionNotes.push(`picker data URL ${dataUrl}: ${normalized.length} observations`);
     } catch (error) {
       extractionNotes.push(`${dataUrl}: ${error instanceof Error ? error.message : String(error)}`);
@@ -604,6 +760,10 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
 
   const csvCandidates = state.sources.filter((s) => s.machineReadable && /\.(csv|tsv)(\?|$)/i.test(s.url) && s.accepts !== false);
   for (const candidate of csvCandidates.slice(0, 3)) {
+    if (extractedUrls.has(candidate.url)) {
+      extractionNotes.push(`${candidate.url}: skipped, already extracted`);
+      continue;
+    }
     try {
       const { getText } = await import('./connectors');
       const { text, status } = await getText(candidate.url, { timeoutMs: 60_000 });
@@ -619,6 +779,7 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
       const drafts = await canonicalizeDrafts(csvDrafts.slice(0, 200_000), { countryOnly: plan.entityType === 'country' && /country|nation|population/i.test(plan.topic) });
       const normalized = await normalizeDrafts(drafts, 'count');
       collected.push(...normalized.map((d) => toObservation(d, candidate, timeRange)));
+      extractedUrls.add(candidate.url);
       extractionNotes.push(`${candidate.url}: ${normalized.length} observations`);
     } catch (error) {
       extractionNotes.push(`${candidate.url}: ${error instanceof Error ? error.message : String(error)}`);
@@ -652,9 +813,16 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
           const extraction = await extractRowsFromText(text, { url: best.url, publisher: best.publisher, title: best.title }, plan, ctx);
           extractionNotes.push(`AI text extraction from ${best.url}: kept ${extraction.rows.length}, dropped ${extraction.dropped}`);
           for (const note of extraction.notes) extractionNotes.push(`extractor: ${note}`);
+          const caveats = extraction.rows.filter((r) => r.caveat).slice(0, 10);
+          for (const row of caveats) extractionNotes.push(`extractor caveat: ${row.entity} @ ${row.date} - ${row.caveat}`);
           if (extraction.rows.length > 0) {
             const drafts: ExtractedDraft[] = extraction.rows.map((r) => ({ entity: r.entity, date: r.date, value: r.value, unit: r.unit ?? 'count' }));
-            const normalized = await normalizeDrafts(drafts, 'count');
+            // Every other extraction path canonicalises entity names through
+            // the Rust core before this point. Without it, "USA" and
+            // "United States" from the same page become two different
+            // entities and verification can never compare them.
+            const canonical = await canonicalizeDrafts(drafts, { countryOnly: plan.entityType === 'country' });
+            const normalized = await normalizeDrafts(canonical, 'count');
             collected.push(...normalized.map((d) => toObservation(d, best, timeRange)));
           }
         }
@@ -676,18 +844,32 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
 
   // --- 4. Verification ----------------------------------------------------
   store.setStatus(state, 'VERIFYING');
-  const verified = verifyAcrossSources(observations, { metric: plan.metric });
+  // Cleaning pass first: junk observations (missing entity/date, non-finite
+  // values, negative counts) are dropped with reasons, before they can reach
+  // the comparison cells.
+  const sanitized = sanitizeObservations(observations);
+  for (const problem of sanitized.problems.slice(0, 20)) state.notes.push(`sanitize: ${problem}`);
+  const verified = verifyAcrossSources(sanitized.observations, { metric: plan.metric });
+  // Surface what was actually checked: the summary (counts per status,
+  // conflicts) plus the unit-mismatch and outlier notes. Without this the
+  // verification detail exists only in memory and the reviewer sees nothing.
+  for (const line of verificationSummary(verified)) state.notes.push(line);
+  state.notes.push(...verified.notes.slice(0, 20));
   // Report the range the data actually covers, not the range we asked for.
   const actualRange = observedTimeRange(verified.observations, timeRange);
   if (actualRange.end !== String(timeRange.end).slice(0, 4) || actualRange.start !== String(timeRange.start).slice(0, 4)) {
     extractionNotes.push(`observed range ${actualRange.start}-${actualRange.end} (requested ${timeRange.start}-${timeRange.end})`);
   }
+  // The dataset unit is what the observations actually carry (USD, percent,
+  // ...), not a hardcoded 'count' - the old label lied on GDP/share datasets.
+  const datasetUnit = majorityUnit(verified.observations);
+  extractionNotes.push(`dataset unit: ${datasetUnit} (majority of valued observations)`);
   const dataset = buildDataset({
     projectId: state.projectId,
     datasetId: `dataset_${state.projectId}`,
     name: plan.topic,
     metric: plan.metric,
-    unit: 'count',
+    unit: datasetUnit,
     timeRange: actualRange,
     frequency: plan.frequency,
     missingDataPolicy: plan.missingDataPolicy,
@@ -695,6 +877,16 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
     conflicts: verified.conflicts,
   });
   store.checkpoint(state, 'VERIFICATION_COMPLETE');
+
+  // A dataset with no observations is a failed run, not an empty video:
+  // refuse to emit a frame tape and spec for nothing.
+  if (dataset.stats.observations === 0) {
+    const reason = `research produced no observations for "${plan.topic}" - refusing to render an empty video`;
+    state.notes.push(reason);
+    store.setStatus(state, 'FAILED');
+    store.save(state);
+    throw new Error(reason);
+  }
 
   // --- 5. Quality ---------------------------------------------------------
   const quality: DataQualityReport = await dataQualityReport(dataset);
@@ -716,7 +908,20 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
     notes: ['frame tape not generated'],
   };
   try {
-    tape = await buildFrameTape(dataset, {
+    // CONFLICTING and REJECTED observations must never reach the race: the
+    // verifier flags material disagreement instead of averaging, but a bar
+    // chart still has to pick one number, so the honest move is to leave
+    // those cells out of the tape entirely. They stay in the dataset (and
+    // the conflicts list) for provenance and reviewer inspection.
+    const tapeDataset = {
+      ...dataset,
+      observations: dataset.observations.filter((o) => o.status !== 'CONFLICTING' && o.status !== 'REJECTED'),
+    };
+    const excludedFromTape = dataset.stats.observations - tapeDataset.observations.length;
+    if (excludedFromTape > 0) {
+      state.notes.push(`frame tape excludes ${excludedFromTape} CONFLICTING/REJECTED observations (see dataset conflicts instead)`);
+    }
+    tape = await buildFrameTape(tapeDataset, {
       topN: options.topN ?? Math.min(10, Math.max(3, plan.targetEntityCount)),
       framesPerTransition: options.framesPerTransition ?? 30,
     });
@@ -737,6 +942,11 @@ export async function researchTopic(options: ResearchOptions): Promise<ResearchR
   state.videoSpec = videoSpec;
   state.thumbnail = thumbnail;
   store.checkpoint(state, 'VIDEOSPEC_COMPLETE');
+  // Deterministic QA: structural problems (empty tape, missing assets,
+  // duplicated entities) surface in the run notes instead of shipping
+  // silently. Advisory only - the reviewer decides.
+  const qa = qaCheck(dataset, videoSpec, tape);
+  for (const problem of qa.problems) state.notes.push(`QA: ${problem}`);
   store.setStatus(state, 'READY_FOR_REVIEW');
   store.save(state);
 

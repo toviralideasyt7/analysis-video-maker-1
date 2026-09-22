@@ -7,7 +7,7 @@
  *   frames.json      (FrameTape)      - the pre-computed per-frame bar state
  */
 
-import type { Dataset, ThumbnailSpec, VideoSpec } from '@avm/shared';
+import type { Dataset, Story, ThumbnailSpec, VideoSpec } from '@avm/shared';
 import type { FrameTape } from './frameTape';
 
 export interface RenderInput {
@@ -15,8 +15,10 @@ export interface RenderInput {
   dataset: Dataset;
   frameTape: FrameTape;
   thumbnail?: ThumbnailSpec;
-  /** Base URL for entity flags; `{code}` is replaced by the ISO-3166 alpha-2 code. */
+  /** Narrative beats (hook/setup/sequence/highlights/ending) for the era panel; optional. */
+  story?: Story;
+  /** Bare host for entity flags; components append `/w80|w160/{code}.png` themselves. */
   flagBaseUrl?: string;
 }
 
-export const DEFAULT_FLAG_BASE = 'https://flagcdn.com/w80';
+export const DEFAULT_FLAG_BASE = 'https://flagcdn.com';

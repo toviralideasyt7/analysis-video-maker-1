@@ -1,32 +1,24 @@
 /**
  * The data-race composition.
  *
- * Layout (1280x720 baseline):
- *   top-left   brand mark
- *   top        big title
- *   top-right  large light date stamp
- *   left 62%   horizontal ranking bars (flag + monogram badge + value)
- *   right 38%  fact box during highlights, otherwise the summary panel
- *   bottom-mid group bar chart (regions/segments), when the data has groups
- *   bottom     notes about held/missing values
+ * The data-race composition (1280x720 baseline), in the classic full-bleed style:
+ *   full height  ranking bars from the left edge (name in white bold inside the
+ *                bar, flag at the bar end, value in dark type past the flag)
+ *   right        era panel: giant year, era headline + narrative, featured flags
+ *   (no header during the race; title / ending / source card are own scenes)
  */
 
 import React, { useMemo } from 'react';
 import { AbsoluteFill, Sequence, interpolate, spring, useCurrentFrame, useVideoConfig } from 'remotion';
-import type { Dataset, Story } from '@avm/shared';
-import { makeTheme, formatValue, compactNumber } from './theme';
-import type { FrameTape } from './frameTape';
-import type { RenderInput } from './types';
+import type { Dataset } from '@avm/shared';
+import { makeTheme, compactNumber } from './theme';
+import type { FrameTape, FrameTapeEntity } from './frameTape';
+import { DEFAULT_FLAG_BASE, type RenderInput } from './types';
 import {
   BrandMark,
-  BigDate,
   Canvas,
-  FactBox,
-  GroupBarChart,
-  HighlightArrow,
-  NoteStrip,
+  EraPanel,
   RankingRow,
-  ShareGauge,
   SourceCard,
   TitleBlock,
 } from './components';
@@ -85,160 +77,178 @@ function groupTotals(tape: FrameTape, frameIndex: number): Array<{ label: string
     .slice(0, 5);
 }
 
-const BarRace: React.FC<{ input: RenderInput; highlights: Highlight[]; durationInFrames: number; title: string; subtitle?: string; summary: Record<string, unknown> }> = ({
+/**
+ * The bar-race scene, in the classic full-bleed style of the reference video:
+ * ranking bars run from the left edge across the full 720px height, the entity
+ * name sits in white bold type inside the bar, the flag is attached to the bar
+ * end, the value is set in dark type just past the flag, and the right-hand
+ * panel shows the giant year + era narrative + featured flags. No header
+ * during the race. Values, widths and ranks are interpolated between the two
+ * bracketing tape frames so motion glides instead of stepping.
+ */
+const BarRace: React.FC<{ input: RenderInput; highlights: Highlight[]; durationInFrames: number }> = ({
   input,
   highlights,
   durationInFrames,
-  title,
-  summary,
 }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
-  const theme = makeTheme(input.videoSpec.theme as Record<string, string | number>);
   const tape = input.frameTape;
   const dataset = input.dataset;
-  const smoothed = useMemo(() => buildSmoothRanks(tape), [tape]);
-  const tapeFrameIndex = Math.min(tape.frames.length - 1, Math.max(0, Math.floor((frame / durationInFrames) * tape.frames.length)));
-  const groups = useMemo(() => groupTotals(tape, tapeFrameIndex), [tape, tapeFrameIndex]);
-  const tapeFrame = tape.frames[tapeFrameIndex];
-  const rankMap = smoothed.ranks[tapeFrameIndex] ?? new Map<string, number>();
+  const story = input.story;
+  const flagBaseUrl = input.flagBaseUrl ?? DEFAULT_FLAG_BASE;
 
-  const rowHeight = 50;
-  const listTop = 176;
-  const barAreaWidth = 620;
-  const activeHighlight = highlights.find((h) => frame >= h.atFrame && frame < h.atFrame + fps * 6);
+  const tapeCount = tape.frames.length;
+  const tapeFps = tape.fps || 30;
 
-  const headerAppear = spring({ frame, fps, durationInFrames: 18, config: { damping: 200 } });
-  const summaryAppear = spring({ frame, fps, durationInFrames: 20, config: { damping: 200 } });
+  // Fractional position in tape-frame units; the two bracketing tape frames
+  // are interpolated so bars glide smoothly at any render fps.
+  const tapePos = Math.min(tapeCount - 1, Math.max(0, (frame / Math.max(1, durationInFrames)) * tapeCount));
+  const i0 = Math.min(tapeCount - 1, Math.floor(tapePos));
+  const i1 = Math.min(tapeCount - 1, i0 + 1);
+  const t = Math.min(1, Math.max(0, tapePos - i0));
+  const f0 = tape.frames[i0];
+  const f1 = tape.frames[i1];
 
-  const topBar = tapeFrame?.bars[0];
-  const topEntity = topBar ? tape.entities.find((e) => e.id === topBar.entityId) : undefined;
-  const visibleTotal = (tapeFrame?.bars ?? []).reduce((sum, b) => sum + b.value, 0);
-  const sharePercent = visibleTotal > 0 && topBar ? ((topBar.value / visibleTotal) * 100).toFixed(0) : '0';
-  const finalLabel = tapeFrame?.label ?? '';
-  const publishers = `source: ${Array.from(new Set(dataset.observations.map((o) => o.source.publisher))).slice(0, 3).join(', ')}`;
-  const crossChecked =
-    dataset.stats.verified > 0
-      ? `${dataset.stats.verified} cross-checked values`
-      : 'single source: values are reported, not cross-verified';
+  const entityById = useMemo(() => new Map(tape.entities.map((e) => [e.id, e])), [tape]);
+  const labelToTapeIndex = useMemo(() => {
+    const m = new Map<string, number>();
+    tape.frames.forEach((f, idx) => {
+      if (!m.has(f.label)) m.set(f.label, idx);
+    });
+    return m;
+  }, [tape]);
+
+  interface Row {
+    id: string;
+    value: number;
+    widthFrac: number;
+    rank: number;
+    held: boolean;
+    appear: number;
+  }
+
+  const { rows, barCount } = useMemo(() => {
+    const a = new Map((f0?.bars ?? []).map((b) => [b.entityId, b]));
+    const b = new Map((f1?.bars ?? []).map((b) => [b.entityId, b]));
+    const ids = new Set<string>([...a.keys(), ...b.keys()]);
+    const count = Math.max(f0?.bars.length ?? 0, f1?.bars.length ?? 0, 1);
+    const out: Row[] = [];
+    for (const id of ids) {
+      const ba = a.get(id);
+      const bb = b.get(id);
+      if (ba && bb) {
+        out.push({
+          id,
+          value: ba.value + (bb.value - ba.value) * t,
+          widthFrac: ba.width + (bb.width - ba.width) * t,
+          rank: ba.rank + (bb.rank - ba.rank) * t,
+          held: ba.held ?? bb.held ?? false,
+          appear: 1,
+        });
+      } else if (bb) {
+        // entering the top-N: glide up from below the list
+        out.push({
+          id,
+          value: bb.value,
+          widthFrac: bb.width * t,
+          rank: count + 1 + (bb.rank - (count + 1)) * t,
+          held: bb.held ?? false,
+          appear: t,
+        });
+      } else if (ba) {
+        // leaving the top-N: glide down out of the list
+        out.push({
+          id,
+          value: ba.value,
+          widthFrac: ba.width * (1 - t),
+          rank: ba.rank + (count + 1 - ba.rank) * t,
+          held: ba.held ?? false,
+          appear: 1 - t,
+        });
+      }
+    }
+    out.sort((x, y) => x.rank - y.rank);
+    return { rows: out.slice(0, count + 2), barCount: count };
+  }, [f0, f1, t]);
+
+  const rowHeight = 720 / Math.max(1, barCount);
+  const maxBarWidth = 800; // leader's bar end; flag + value sit past it, panel starts at x=968
+  const introAppear = interpolate(frame, [0, Math.min(18, durationInFrames)], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  });
+
+  // Right-hand era panel ------------------------------------------------------
+  const activeHighlight = highlights.find(
+    (h) => tapePos >= h.atFrame && tapePos < h.atFrame + 6 * tapeFps,
+  );
+  const currentLabel = t < 0.5 ? f0?.label ?? '' : f1?.label ?? '';
+  const segment = useMemo(() => {
+    if (!story) return undefined;
+    let current: (typeof story.sequence)[number] | undefined;
+    for (const s of story.sequence) {
+      const idx = labelToTapeIndex.get(s.atLabel);
+      const curIdx = current ? labelToTapeIndex.get(current.atLabel) ?? -1 : -1;
+      if (idx !== undefined && idx <= tapePos && idx > curIdx) current = s;
+    }
+    return current;
+  }, [story, labelToTapeIndex, tapePos]);
+
+  const featured = useMemo(() => {
+    if (activeHighlight) {
+      const e = entityById.get(activeHighlight.entityId);
+      return e ? [e] : [];
+    }
+    return [...rows]
+      .sort((x, y) => y.value - x.value)
+      .slice(0, 2)
+      .map((r) => entityById.get(r.id))
+      .filter((e): e is FrameTapeEntity => !!e);
+  }, [activeHighlight, rows, entityById]);
+
+  const panelAppear = spring({ frame, fps, durationInFrames: 24, config: { damping: 200 } });
 
   return (
-    <AbsoluteFill>
-      <div style={{ position: 'absolute', left: 46, top: 40 }}>
-        <BrandMark theme={theme} />
-      </div>
-
-      <div style={{ position: 'absolute', left: 130, right: 300, top: 44, opacity: headerAppear }}>
-        <div style={{ fontSize: 40, fontWeight: 800, color: theme.primaryText, letterSpacing: '-0.03em', lineHeight: 1.05 }}>{title}</div>
-        <div style={{ fontSize: 19, fontWeight: 600, color: theme.secondaryText, marginTop: 4 }}>
-          {dataset.metric} · {dataset.stats.observations.toLocaleString('en-US')} observations · {dataset.stats.entities} entities ·{' '}
-          {publishers} · {crossChecked}
-        </div>
-      </div>
-
-      <div style={{ position: 'absolute', right: 46, top: 44, textAlign: 'right' }}>
-        <BigDate label={tapeFrame?.label ?? ''} theme={theme} fontSize={64} />
-      </div>
-
-      {/* ranking list */}
-      <div style={{ position: 'absolute', left: 46, top: listTop, width: 46 + barAreaWidth + 120, height: 720 - listTop - 60 }}>
-        {(tapeFrame?.bars ?? []).map((bar) => {
-          const entity = tape.entities.find((e) => e.id === bar.entityId);
-          if (!entity) return null;
-          const animatedRank = rankMap.get(bar.entityId) ?? bar.rank;
-          const y = (animatedRank - 1) * rowHeight;
-          const appear = spring({ frame: frame - 4, fps, durationInFrames: 16, config: { damping: 200 } });
-          return (
-            <RankingRow
-              key={bar.entityId}
-              entity={entity}
-              bar={bar}
-              theme={theme}
-              maxWidth={barAreaWidth}
-              widthFraction={bar.width}
-              rowHeight={rowHeight}
-              unit={dataset.unit}
-              y={y}
-              appear={appear}
-            />
-          );
-        })}
-      </div>
-
-      {/* mover arrow on the bar that climbed the most */}
-      {(tapeFrame?.bars ?? []).some((b) => b.isMover) ? (
-        <div style={{ position: 'absolute', left: 46 + barAreaWidth + 130, top: listTop }}>
-          {(tapeFrame?.bars ?? [])
-            .filter((b) => b.isMover && (b.rankDelta ?? 0) > 0)
-            .slice(0, 1)
-            .map((b) => {
-              const entity = tape.entities.find((e) => e.id === b.entityId);
-              const animatedRank = rankMap.get(b.entityId) ?? b.rank;
-              return (
-                <div key={b.entityId} style={{ position: 'absolute', top: (animatedRank - 1) * rowHeight + rowHeight * 0.2, display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <HighlightArrow theme={theme} color={theme.accent} appear={1} />
-                  <div style={{ fontSize: 15, fontWeight: 800, color: theme.accent, whiteSpace: 'nowrap' }}>
-                    +{Math.abs(b.rankDelta ?? 0)} {entity?.name ?? b.entityId}
-                  </div>
-                </div>
-              );
-            })}
-        </div>
-      ) : null}
-
-      {/* right column: fact box while a highlight is active, summary otherwise */}
-      <div style={{ position: 'absolute', right: 46, top: listTop, width: 380 }}>
-        {activeHighlight ? (
-          <FactBox
-            heading={activeHighlight.factBox?.heading ?? activeHighlight.headline}
-            body={activeHighlight.factBox?.body ?? activeHighlight.detail}
-            dateLabel={activeHighlight.factBox?.dateLabel ?? activeHighlight.atLabel}
-            wordmark={activeHighlight.factBox?.wordmark ?? tape.entities.find((e) => e.id === activeHighlight.entityId)?.name}
-            accentColor={tape.entities.find((e) => e.id === activeHighlight.entityId)?.color}
-            theme={theme}
-            appear={interpolate(frame, [activeHighlight.atFrame, activeHighlight.atFrame + 12], [0, 1], { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' })}
-            width={380}
+    <AbsoluteFill style={{ background: '#ffffff' }}>
+      {rows.map((row) => {
+        const entity = entityById.get(row.id);
+        if (!entity) return null;
+        return (
+          <RankingRow
+            key={row.id}
+            entity={entity}
+            value={row.value}
+            widthFrac={row.widthFrac}
+            rank={row.rank}
+            held={row.held}
+            unit={dataset.unit}
+            y={(row.rank - 1) * rowHeight}
+            rowHeight={rowHeight}
+            maxBarWidth={maxBarWidth}
+            appear={Math.max(0, Math.min(1, row.appear * introAppear))}
+            flagBaseUrl={flagBaseUrl}
           />
-        ) : (
-          <div style={{ opacity: summaryAppear, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 14 }}>
-            <div style={{ fontSize: 30, fontWeight: 800, color: theme.secondaryText }}>{String(summary.heading ?? dataset.metric)}</div>
-            <div style={{ fontSize: 42, fontWeight: 800, color: theme.primaryText }}>{topBar ? formatValue(topBar.value, dataset.unit) : '-'}</div>
-            <div style={{ fontSize: 20, fontWeight: 800, color: theme.primaryText, marginTop: -6 }}>
-              {topEntity?.name ?? ''} leads in {tapeFrame?.label ?? ''}
-            </div>
-            <ShareGauge
-              fraction={visibleTotal > 0 ? (topBar?.value ?? 0) / visibleTotal : 0}
-              label={`${sharePercent}% of the top ${(tapeFrame?.bars ?? []).length} total (${formatValue(visibleTotal, dataset.unit)})`}
-              color={topEntity?.color ?? theme.accent}
-              theme={theme}
-              width={380}
-              appear={summaryAppear}
-            />
-            {groups.length > 1 ? (
-              <div style={{ marginTop: 6, alignSelf: 'flex-end' }}>
-                <div style={{ fontSize: 16, fontWeight: 700, color: theme.secondaryText, marginBottom: 4, textAlign: 'right' }}>
-                  by region, {finalLabel}
-                </div>
-                <GroupBarChart groups={groups} theme={theme} width={360} height={168} appear={summaryAppear} />
-              </div>
-            ) : null}
-          </div>
-        )}
-      </div>
-
-      <NoteStrip notes={tape.notes} theme={theme} />
+        );
+      })}
+      <EraPanel
+        yearLabel={activeHighlight?.atLabel ?? currentLabel}
+        title={activeHighlight?.headline}
+        body={activeHighlight?.detail ?? segment?.text}
+        featured={featured}
+        flagBaseUrl={flagBaseUrl}
+        appear={panelAppear}
+      />
     </AbsoluteFill>
   );
 };
+
 
 export const DataRace: React.FC<{ input: RenderInput }> = ({ input }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
   const theme = makeTheme(input.videoSpec.theme as Record<string, string | number>);
   const spec = input.videoSpec;
-  const story = (input.dataset ? undefined : undefined) as Story | undefined;
-  void story;
-
   const offsets: Array<{ id: string; type: string; from: number; to: number; durationInFrames: number; scene: (typeof spec.scenes)[number] }> = [];
   let cursor = 0;
   for (const scene of spec.scenes) {
@@ -259,7 +269,6 @@ export const DataRace: React.FC<{ input: RenderInput }> = ({ input }) => {
       factBox: h.factBox as Highlight['factBox'],
     } satisfies Highlight;
   });
-  const summary = ((raceOffset?.scene.props?.summary as Record<string, unknown>) ?? {}) as Record<string, unknown>;
   const raceFrom = raceOffset?.from ?? 0;
   const raceDuration = raceOffset?.durationInFrames ?? input.frameTape.durationInFrames;
 
@@ -310,14 +319,7 @@ export const DataRace: React.FC<{ input: RenderInput }> = ({ input }) => {
 
       {raceOffset ? (
         <Sequence from={raceOffset.from} durationInFrames={raceOffset.durationInFrames}>
-          <BarRace
-            input={input}
-            highlights={highlights}
-            durationInFrames={raceDuration}
-            title={spec.metadata.title}
-            subtitle={spec.metadata.subtitle}
-            summary={summary}
-          />
+          <BarRace input={input} highlights={highlights} durationInFrames={raceDuration} />
         </Sequence>
       ) : null}
 
