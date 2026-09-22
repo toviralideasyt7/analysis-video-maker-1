@@ -92,8 +92,8 @@ export const api = {
   registry: () => request<{ registry: Array<Record<string, unknown>> }>('/api/sources'),
   listProjects: () => request<{ projects: ProjectSummary[] }>('/api/projects'),
   getProject: (id: string) => request<{ project: ProjectState }>(`/api/projects/${id}`),
-  createProject: (topic: string) =>
-    request<{ project: ProjectState }>('/api/projects', { method: 'POST', body: JSON.stringify({ topic }) }),
+  createProject: (topic: string, title?: string) =>
+    request<{ project: ProjectState }>('/api/projects', { method: 'POST', body: JSON.stringify({ topic, title }) }),
   research: (id: string, body: Record<string, unknown> = {}) =>
     request<{ accepted: boolean }>(`/api/projects/${id}/research`, { method: 'POST', body: JSON.stringify(body) }),
   researchStatus: (id: string) => request<Record<string, unknown>>(`/api/projects/${id}/research/status`),
