@@ -207,8 +207,12 @@ app.post('/api/projects/:id/research', async (c) => {
 app.post('/api/projects/:id/render', async (c) => {
   const id = c.req.param('id');
   const store = new KVProjectStore(c.env.PROJECTS_KV);
-  const project = await store.get(id);
-  if (!project) return c.json({ error: 'project not found' }, 404);
+  let project;
+  try {
+    project = await store.load(id);
+  } catch {
+    return c.json({ error: 'project not found' }, 404);
+  }
 
   const owner = c.env.GITHUB_OWNER ?? 'sujitbhai7710';
   const repo = c.env.GITHUB_REPO ?? 'analysis-video-maker';
@@ -248,7 +252,9 @@ app.post('/api/projects/:id/render', async (c) => {
   }
 
   // Mark project as rendering
-  await store.update(id, { status: 'RENDERING' } as never);
+  project.status = 'RENDERING';
+  project.updatedAt = new Date().toISOString();
+  await store.save(project);
 
   return c.json({
     renderJob: { status: 'DISPATCHED', projectId: id },
