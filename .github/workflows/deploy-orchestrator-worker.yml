@@ -1,0 +1,56 @@
+# Deploy the orchestrator API as a Cloudflare Worker.
+# Triggered on push to main when the orchestrator or its worker entry changes,
+# or manually via workflow_dispatch.
+
+name: deploy-orchestrator-worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'services/orchestrator/**'
+      - '.github/workflows/deploy-orchestrator-worker.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-orchestrator-worker
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: services/orchestrator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci --omit=dev || npm ci
+        working-directory: .
+
+      - name: Ensure R2 bucket exists
+        run: |
+          npx wrangler r2 bucket create avm-videos 2>&1 | tail -2 || true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy worker
+        run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Smoke test
+        run: |
+          sleep 8
+          URL="https://avm-orchestrator.${{ vars.CLOUDFLARE_WORKERS_SUBDOMAIN }}.workers.dev/api/health"
+          echo "Checking $URL"
+          curl -fsS --max-time 30 "$URL" | head -c 300
+          echo ""

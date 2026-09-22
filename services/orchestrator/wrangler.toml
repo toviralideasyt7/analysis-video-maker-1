@@ -1,0 +1,19 @@
+# Cloudflare Worker: avm-orchestrator
+# Public API backend for the analysis-video-maker frontend.
+# KV for project storage, R2 for rendered videos.
+
+name = "avm-orchestrator"
+main = "src/worker.ts"
+compatibility_date = "2026-01-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://race-video-studio.pages.dev"
+
+[[kv_namespaces]]
+binding = "PROJECTS_KV"
+# User's existing KV namespace (keys are prefixed `project:`, isolated from sessions).
+id = "6abbd87e08f34791acbbdf8ae6542d27"
+
+[[r2_buckets]]
+binding = "VIDEOS_BUCKET"
+bucket_name = "avm-videos"
