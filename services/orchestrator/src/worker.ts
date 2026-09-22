@@ -11,7 +11,7 @@ import { KVProjectStore, type KVNamespaceLike, type WorkerLimits } from './kv-st
 
 interface Env {
   PROJECTS_KV: KVNamespaceLike;
-  VIDEOS_BUCKET: {
+  VIDEOS_BUCKET?: {
     list(opts?: { prefix?: string }): Promise<{ objects: Array<{ key: string; size: number; uploaded: Date }> }>;
     get(key: string, opts?: { range?: { offset: number; length: number } }): Promise<{
       body: ReadableStream;
@@ -19,6 +19,7 @@ interface Env {
     } | null>;
   };
   ALLOWED_ORIGINS?: string;
+  PAGES_ORIGIN?: string;
   // AI provider config (set as worker secrets/vars)
   NARA_API_KEY?: string;
   NARA_BASE_URL?: string;
@@ -88,25 +89,46 @@ app.get('/api/projects/:id', async (c) => {
   }
 });
 
-// --- Renders (R2-backed) ---
+// --- Renders ---
+// Videos are hosted as static assets on the Pages site (apps/web/public/videos/).
+// When R2 is enabled, the bucket takes precedence.
+
+const STATIC_VIDEOS: Array<{ filename: string; sizeBytes: number; createdAt: string }> = [
+  { filename: 'world-population-by-country-20260922.mp4', sizeBytes: 72200000, createdAt: '2026-09-22T15:55:00Z' },
+];
+
+function pagesOrigin(c: { env: Env }): string {
+  return c.env.PAGES_ORIGIN ?? 'https://race-video-studio.pages.dev';
+}
 
 app.get('/api/renders', async (c) => {
   const bucket = c.env.VIDEOS_BUCKET;
-  if (!bucket) return c.json({ renders: [] });
-  const listed = await bucket.list({ prefix: 'renders/' });
-  const renders = listed.objects
-    .filter((o) => o.key.toLowerCase().endsWith('.mp4'))
-    .map((o) => {
-      const filename = o.key.replace(/^renders\//, '');
-      return {
-        filename,
-        title: filename.replace(/\.mp4$/i, '').replace(/[-_]/g, ' '),
-        sizeBytes: o.size,
-        createdAt: o.uploaded.toISOString(),
-        url: `/api/renders/file/${encodeURIComponent(filename)}`,
-      };
-    })
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  if (bucket) {
+    const listed = await bucket.list({ prefix: 'renders/' });
+    const renders = listed.objects
+      .filter((o) => o.key.toLowerCase().endsWith('.mp4'))
+      .map((o) => {
+        const filename = o.key.replace(/^renders\//, '');
+        return {
+          filename,
+          title: filename.replace(/\.mp4$/i, '').replace(/[-_]/g, ' '),
+          sizeBytes: o.size,
+          createdAt: o.uploaded.toISOString(),
+          url: `/api/renders/file/${encodeURIComponent(filename)}`,
+        };
+      })
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+    return c.json({ renders });
+  }
+  // Fallback: static videos hosted on the Pages site.
+  const origin = pagesOrigin(c);
+  const renders = STATIC_VIDEOS.map((v) => ({
+    filename: v.filename,
+    title: v.filename.replace(/\.mp4$/i, '').replace(/[-_]/g, ' '),
+    sizeBytes: v.sizeBytes,
+    createdAt: v.createdAt,
+    url: `${origin}/videos/${encodeURIComponent(v.filename)}`,
+  }));
   return c.json({ renders });
 });
 

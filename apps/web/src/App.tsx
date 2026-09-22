@@ -160,6 +160,10 @@ function ErrorBanner({ message, onRetry }: { message: string; onRetry?: () => vo
 /* Video library                                                       */
 /* ------------------------------------------------------------------ */
 
+function videoSrc(url: string): string {
+  return url.startsWith('http') ? url : `${API_BASE}${url}`;
+}
+
 function VideoPlayerModal({ video, onClose }: { video: RenderItem; onClose: () => void }): React.ReactElement {
   const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -187,7 +191,7 @@ function VideoPlayerModal({ video, onClose }: { video: RenderItem; onClose: () =
             </button>
           </div>
           <video
-            src={`${API_BASE}${video.url}`}
+            src={videoSrc(video.url)}
             controls
             autoPlay
             playsInline
@@ -200,7 +204,7 @@ function VideoPlayerModal({ video, onClose }: { video: RenderItem; onClose: () =
             <span aria-hidden="true">·</span>
             <span>{formatDate(video.createdAt)}</span>
             <a
-              href={`${API_BASE}${video.url}`}
+              href={videoSrc(video.url)}
               download={video.filename}
               className="btn-secondary ml-auto"
               onClick={(e) => e.stopPropagation()}
@@ -301,7 +305,7 @@ function VideosGallery({ backend }: { backend: BackendState }): React.ReactEleme
               aria-label={`Play ${v.title}`}
             >
               <div className="video-thumb">
-                <video src={`${API_BASE}${v.url}#t=2`} preload="metadata" muted playsInline aria-hidden="true" />
+                <video src={videoSrc(v.url) + "#t=2"} preload="metadata" muted playsInline aria-hidden="true" />
                 <div className="play-overlay" aria-hidden="true">
                   <div className="flex h-14 w-14 items-center justify-center rounded-full bg-accent shadow-lg">
                     <Play size={22} className="ml-0.5 text-white" fill="currentColor" />

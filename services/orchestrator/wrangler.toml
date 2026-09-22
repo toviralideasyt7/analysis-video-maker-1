@@ -14,6 +14,8 @@ binding = "PROJECTS_KV"
 # User's existing KV namespace (keys are prefixed `project:`, isolated from sessions).
 id = "6abbd87e08f34791acbbdf8ae6542d27"
 
-[[r2_buckets]]
-binding = "VIDEOS_BUCKET"
-bucket_name = "avm-videos"
+# R2 bucket binding (uncomment after enabling R2 in the Cloudflare dashboard:
+# https://dash.cloudflare.com -> R2 -> Enable)
+# [[r2_buckets]]
+# binding = "VIDEOS_BUCKET"
+# bucket_name = "avm-videos"
