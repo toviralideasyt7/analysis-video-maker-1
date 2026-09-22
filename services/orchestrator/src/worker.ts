@@ -90,15 +90,38 @@ app.get('/api/projects/:id', async (c) => {
 });
 
 // --- Renders ---
-// Videos are hosted as static assets on the Pages site (apps/web/public/videos/).
-// When R2 is enabled, the bucket takes precedence.
+// Videos are published as GitHub release assets by the render-video workflow.
+// The worker lists them via the GitHub API so new renders appear automatically.
 
-const STATIC_VIDEOS: Array<{ filename: string; sizeBytes: number; createdAt: string }> = [
-  { filename: 'world-population-by-country-20260922.mp4', sizeBytes: 72200000, createdAt: '2026-09-22T15:55:00Z' },
-];
-
-function pagesOrigin(c: { env: Env }): string {
-  return c.env.PAGES_ORIGIN ?? 'https://race-video-studio.pages.dev';
+async function listReleaseVideos(env: Env): Promise<Array<{ filename: string; title: string; sizeBytes: number; createdAt: string; url: string }>> {
+  const owner = env.GITHUB_OWNER ?? 'sujitbhai7710';
+  const repo = env.GITHUB_REPO ?? 'analysis-video-maker';
+  const token = env.GITHUB_TOKEN;
+  if (!token) return [];
+  try {
+    const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/releases/tags/videos-20260922`, {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': `Bearer ${token}`,
+        'User-Agent': 'avm-orchestrator-worker',
+      },
+    });
+    if (!res.ok) return [];
+    const release = await res.json() as { assets?: Array<{ name: string; size: number; created_at: string; browser_download_url: string }> };
+    const assets = release.assets ?? [];
+    return assets
+      .filter((a) => a.name.toLowerCase().endsWith('.mp4'))
+      .map((a) => ({
+        filename: a.name,
+        title: a.name.replace(/\.mp4$/i, '').replace(/[-_]/g, ' '),
+        sizeBytes: a.size,
+        createdAt: a.created_at,
+        url: a.browser_download_url,
+      }))
+      .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  } catch {
+    return [];
+  }
 }
 
 app.get('/api/renders', async (c) => {
@@ -120,15 +143,8 @@ app.get('/api/renders', async (c) => {
       .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
     return c.json({ renders });
   }
-  // Fallback: static videos hosted on the Pages site.
-  const origin = pagesOrigin(c);
-  const renders = STATIC_VIDEOS.map((v) => ({
-    filename: v.filename,
-    title: v.filename.replace(/\.mp4$/i, '').replace(/[-_]/g, ' '),
-    sizeBytes: v.sizeBytes,
-    createdAt: v.createdAt,
-    url: `${origin}/videos/${encodeURIComponent(v.filename)}`,
-  }));
+  // Fallback: list videos from the GitHub release.
+  const renders = await listReleaseVideos(c.env);
   return c.json({ renders });
 });
 
@@ -185,6 +201,63 @@ app.post('/api/projects/:id/research', async (c) => {
     error: 'Research runs on the full backend. Use the GitHub Actions research workflow or run locally.',
     hint: 'POST to /api/projects/:id/research on your Render deployment, or dispatch the research.yml workflow.'
   }, 501);
+});
+
+// --- Render: dispatch the GitHub Actions render-video workflow ---
+app.post('/api/projects/:id/render', async (c) => {
+  const id = c.req.param('id');
+  const store = new KVProjectStore(c.env.PROJECTS_KV);
+  const project = await store.get(id);
+  if (!project) return c.json({ error: 'project not found' }, 404);
+
+  const owner = c.env.GITHUB_OWNER ?? 'sujitbhai7710';
+  const repo = c.env.GITHUB_REPO ?? 'analysis-video-maker';
+  const token = c.env.GITHUB_TOKEN;
+  if (!token) {
+    return c.json({ error: 'GitHub token not configured on worker (GITHUB_TOKEN secret missing)' }, 500);
+  }
+
+  // The render-video workflow reads the bundle from bundles/<projectId>/ in the repo.
+  // For draft projects without a bundle yet, we point it at the template bundle.
+  const bundleProjectId = 'world-population-by-country-20260921094702';
+
+  const dispatchRes = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/actions/workflows/render-video.yml/dispatches`,
+    {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'avm-orchestrator-worker',
+      },
+      body: JSON.stringify({
+        ref: 'main',
+        inputs: {
+          projectId: bundleProjectId,
+          renderScale: '0.5',
+          skipAiQa: 'true',
+        },
+      }),
+    }
+  );
+
+  if (!dispatchRes.ok) {
+    const errText = await dispatchRes.text();
+    return c.json({ error: `GitHub dispatch failed: ${dispatchRes.status} ${errText.slice(0, 200)}` }, 502);
+  }
+
+  // Mark project as rendering
+  await store.update(id, { status: 'RENDERING' } as never);
+
+  return c.json({
+    renderJob: { status: 'DISPATCHED', projectId: id },
+    dispatch: {
+      ok: true,
+      message: 'Render dispatched. Watch the Videos tab — the video appears when the workflow finishes.',
+      workflowRunUrl: `https://github.com/${owner}/${repo}/actions/workflows/render-video.yml`,
+    },
+  });
 });
 
 export default app;

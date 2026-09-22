@@ -153,6 +153,26 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # Upload the final MP4 to the GitHub release so the frontend Video Library
+      # can serve it directly (release assets support large files, no Pages 25MB cap).
+      - name: Publish MP4 to GitHub release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MP4="projects/${PROJECT_ID}/renders/${PROJECT_ID}-final.mp4"
+          # Ensure the release exists (create if missing)
+          gh release view videos-20260922 >/dev/null 2>&1 || \
+            gh release create videos-20260922 --title "Rendered Videos" --notes "Rendered analysis videos."
+          # Upload (overwrite if the asset already exists)
+          ASSET_NAME="${PROJECT_ID}-final.mp4"
+          if gh release view videos-20260922 --json assets -q ".assets[].name" | grep -qx "$ASSET_NAME"; then
+            gh release delete-asset videos-20260922 "$ASSET_NAME" --yes
+          fi
+          gh release upload videos-20260922 "$MP4" --clobber
+          echo "Uploaded $ASSET_NAME to release videos-20260922"
+
       # Optional: push the finished asset to Cloudflare R2 (S3 compatible).
       - name: Publish to object storage
         if: ${{ env.R2_BUCKET != '' }}
